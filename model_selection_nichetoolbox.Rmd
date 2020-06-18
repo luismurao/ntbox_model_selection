@@ -1,0 +1,291 @@
+---
+title: "NicheToolBox: An example of the model selection protocol for ellipsoid models"
+author: "Luis Osorio-Olvera, Andrés Lira-Noriega, Jorge Soberón, Manuel Falconi,  A. Townsend Peterson,  Rusby Guadalupe Díaz-Contreras, and Enrique Martinez-Meyer"
+date: "`r Sys.Date()`"
+bibliography: library.bib
+output:
+  rmdformats::readthedown:
+    code_folding: show
+    self_contained: true
+    number_sections: true
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    keep_md: true
+    highlight: tango
+    df_print: kable 
+    toc_depth: 1
+    fig_width: 8
+    fig_height: 8
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+library(kableExtra)
+library(dplyr)
+library(ntbox)
+library(raster)
+
+amp <- normalizePath("../america_sin_islas")
+am <- rgdal::readOGR(dsn =amp,layer="america_sn_islas")
+dAll_a <- rio::import("margay_gbif_raw.csv")
+set.seed(12345)
+```
+
+# The example
+
+We demonstrate the use of the model selection protocol implemented in `ntbox` by retrieving occurrence information from the species *Leopardus wiedii*, a small cat that distributes in the Neotropics (Fig. 1). Then we use a native function of the package to calibrate and select the best models for  *L. wiedii*.
+
+![Figure 1. *Leopardus wiedii*. The image is taken from [@Sanchez1998]](../Figuras/M1013.JPG)
+
+
+First, we set the random seed in order to make reproducible the example
+
+```{r echo=TRUE,eval=FALSE}
+set.seed(12345)
+```
+
+
+# Get the data for the example
+
+From ntbox, we downloaded available occurrences for *L. wiedii* from the Global Biodiversity Information Facility (https://www.gbif.org) and explore what is the provenance and date of collecting of these points (Fig. 2). 
+
+
+```{r gbif, echo=TRUE,eval=FALSE}
+dAll_a <- ntbox::searh_gbif_data(genus = "Leopardus",
+                                 species = "wiedii",
+                                 occlim = 5000,
+                                 leafletplot = TRUE)
+```
+
+We select those records starting in 1950 as we will use the [bioclimatic](https://www.worldclim.org/current) layers from [WorldClim](https://www.worldclim.org/version1) for the modeling process.
+
+```{r echo=TRUE, eval=TRUE}
+dAll <- dAll_a %>% dplyr::filter(year>=1950)
+```
+
+
+## Environmental data
+
+Now, we use the function `getData` from the package raster [@Hijmans2010] to download the [WorldClim](https://www.worldclim.org/version1) at 2.5 ArcMinutes of resolution (~ 4.65 km at Ecuador)
+
+```{r echo=TRUE, eval=TRUE,dpi=300}
+env_layers <- raster::getData('worldclim', var='bio', res=2.5)
+plot(env_layers[["bio1"]])
+```
+
+## Crop and mask environmental data 
+
+Reading a shapefile for America 
+
+```{r eval=FALSE,echo=TRUE}
+amp <- normalizePath("../america_sin_islas")
+am <- rgdal::readOGR(dsn =amp,layer="america_sn_islas")
+```
+
+Cut the layers using America as a mask
+
+```{r corte, echo=TRUE, eval=TRUE,dpi=300}
+am_env <- raster::crop(env_layers,am)
+am_env <- raster::mask(am_env,am)
+plot(am_env[["bio1"]])
+```
+
+
+## Generate environmental background data
+
+We will generate the random environmental points that will be used to estimate the Partial ROC test (see [@Owens2012;@Cobos2019]) of the calibrated models.
+
+```{r eval=TRUE,echo=TRUE}
+
+env_bg0 <- ntbox::sample_envbg(envlayers = am_env,
+                               nbg = 50000)
+```
+
+# Curate data from duplicated records
+
+First, we extract environmental information from occurrences
+
+```{r echo=TRUE, eval=TRUE}
+dAll_env <- raster::extract(am_env,dAll[,2:3])
+dAll_genv <- data.frame(dAll[,c(2:3,ncol(dAll))],
+                        dAll_env)
+```
+
+We remove duplicated data
+
+```{r echo=TRUE, eval=TRUE}
+dAll_genv_clean <- ntbox::clean_dup(dAll_genv,
+                                    longitude ="longitude",
+                                    latitude = "latitude",
+                                    threshold = res(am_env)[1])
+# remove NA's
+dAll_genv_clean <- na.omit(dAll_genv_clean)
+
+```
+
+See the data on a leaflet map
+
+
+```{r echo=TRUE,eval=TRUE}
+m <- leaflet::leaflet(dAll_genv_clean)
+m <- m %>% leaflet::addTiles()
+m <- m %>% leaflet::addCircleMarkers(lng = ~longitude, 
+                                     lat = ~latitude, 
+                                     popup = ~leaflet_info, 
+                                     fillOpacity = 0.25, 
+                                     radius = 7)
+m
+```
+
+Remove wired occurrences. Click on the pop-up to display gbif information (available when the downloaded data comes from `search_gbif` function), the points that are outside the distribution are the one on San Francisco (this comes from a collection; rowID=400), the record on Florida (rowID=244) and the point that its on latitude and longitude zero (rowID=310). 
+
+```{r echo=TRUE,eval=TRUE}
+rnames <- as.numeric(rownames(dAll_genv_clean))
+# Indixes of the wired data (can change depending the date of the gbif query)
+to_rmIDs <- c(400,244,310)
+to_rm <- which(rnames %in% to_rmIDs)
+dAll_genv_clean <- dAll_genv_clean[-to_rm,]
+```
+
+Explore the curated data
+
+```{r echo=TRUE,eval=TRUE}
+m_cur <- leaflet::leaflet(dAll_genv_clean)
+m_cur <- m_cur %>% leaflet::addTiles()
+m_cur <- m_cur %>% leaflet::addCircleMarkers(lng = ~longitude, 
+                                             lat = ~latitude, 
+                                             popup = ~leaflet_info, 
+                                             fillOpacity = 0.25, 
+                                             radius = 7)
+m_cur
+```
+
+
+
+# Split the data in train and testing 
+
+Now we will create train and testing data using a proportion of 70:30 respectively
+
+```{r echo=TRUE,eval=TRUE}
+trainID <- sample(nrow(dAll_genv_clean),
+                  size =ceiling(nrow(dAll_genv_clean)*0.7))
+```
+
+Geographic train and test data
+
+```{r echo=TRUE,eval=TRUE}
+dtrain <- dAll_genv_clean[trainID,1:2]
+dtest <-  dAll_genv_clean[-trainID,1:2]
+```
+
+Environmental train and test 
+
+```{r echo=TRUE, eval=TRUE}
+dtrain_env <- dAll_genv_clean[-trainID,-c(1:3)]
+dtest_env <- dAll_genv_clean[trainID,-c(1:3)]
+```
+
+
+# Remove strongly correlated variables
+
+First estimate correlation matrix
+
+```{r echo=TRUE, eval=TRUE}
+corsMat <- cor(dtrain_env)
+```
+
+Select environmental variables using a correlation filter of 0.95
+
+```{r echo=TRUE, eval=TRUE}
+
+env_vars <- ntbox::correlation_finder(corsMat,
+                          threshold = 0.95,
+                          verbose = FALSE)$descriptors
+```
+
+# Ellipsoid calibration and selection
+
+For calibrating Minimum Volume Ellipsoid Models [@VanAelst2009] we will use a proportion of 0.95 of the training data for 3,5 and 6 variables. The omission rate criteria is 0.05 (5%). The models will be calibrated and selected in parallel; each job will process 100 models.
+
+```{r slection, echo=TRUE, eval=TRUE}
+nvarstest <- c(3,4,5)
+t1 <- system.time({
+  e_selct <- ntbox::ellipsoid_selection(env_train = dtrain_env,
+                                        env_test = dtest_env,
+                                        env_vars = env_vars,
+                                        level = 0.95,
+                                        nvarstest = nvarstest,
+                                        env_bg = env_bg0,
+                                        omr_criteria=0.05,
+                                        parallel = TRUE,
+                                        comp_each = 100,proc = TRUE)
+})
+# Save the results
+write.csv(e_selct,"margay_model_selection_results.csv",
+          row.names = FALSE)
+```
+The elapsed time in minutes 
+
+```{r}
+t1/60
+```
+
+Now we show the results for 10 best models. The table contains eleven fields:
+
+ 1. **fitted_vars**: The fitted variables
+ 2. **nvars**: Number of variables used to fit the ellipsoid model
+ 3. **om_rate_train**: Omission rate of training data
+ 4. **om_rate_test**: Omission rate of testing data
+ 5. **bg_prevalence**: The estimated prevalence of the species in background data
+ 6. **pval_bin**: The p-value of the binomial test (see [@Peterson2008]) performed in environmental space
+ 7. **pval_proc**: The p-value of the partial ROC test performed in environmental space
+ 8. **env_bg_aucratio**: Environmental background AUC ratio
+ 10. **mean_omr_train_test**: Mean omission rate of testing and training data
+ 11. **rank_by_omr_train_test**: The rank of the models given testing and training data
+
+```{r echo=TRUE, eval=TRUE}
+knitr::kable(head(e_selct,10))
+```
+
+
+# Project the best model
+
+We will project the best model according to the above table. For another complete example see the help of `?ntbox::ellipsoid_selection`.
+
+```{r echo=TRUE, eval=TRUE}
+# Select the model number  one in table e_select
+bestvarcomb <- stringr::str_split(e_selct$fitted_vars,",")[[1]]
+```
+Fit the model in environmental space.
+
+```{r echo=TRUE, eval=TRUE}
+
+best_mod <- ntbox::cov_center(dtrain_env[,bestvarcomb],
+                              mve = T,
+                              level = 0.99,
+                              vars = 1:length(bestvarcomb))
+```
+
+
+```{r echo=TRUE, eval=TRUE}
+mProj <- ntbox::ellipsoidfit(am_env[[bestvarcomb]],
+                             centroid = best_mod$centroid,
+                             covar = best_mod$covariance,
+                             level = 0.99,size = 3)
+if(length(bestvarcomb)==3)
+  rgl::rglwidget()
+
+
+```
+
+Project the model in geographic space
+
+```{r,dpi=300,, eval=TRUE}
+raster::plot(mProj$suitRaster)
+```
+
+# References
+
